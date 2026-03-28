@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy import and_, or_, desc, asc, func
 
-from .models import Account, EmailService, RegistrationTask, Setting, Proxy, CpaService, Sub2ApiService
+from .models import Account, EmailService, RegistrationTask, Setting, Proxy, CpaService, Sub2ApiService, NewapiService
 
 
 TOKEN_FIELD_NAMES = ("access_token", "refresh_token", "id_token", "session_token")
@@ -533,6 +533,47 @@ def delete_proxy(db: Session, proxy_id: int) -> bool:
     return True
 
 
+def delete_proxies_by_ids(db: Session, proxy_ids: Iterable[int]) -> Dict[str, Any]:
+    """按 ID 批量删除代理配置。"""
+    normalized_ids = []
+    seen_ids: Set[int] = set()
+    for proxy_id in proxy_ids:
+        current_id = int(proxy_id)
+        if current_id <= 0 or current_id in seen_ids:
+            continue
+        seen_ids.add(current_id)
+        normalized_ids.append(current_id)
+
+    if not normalized_ids:
+        return {
+            "requested_count": 0,
+            "deleted_count": 0,
+            "not_found_ids": [],
+        }
+
+    existing_ids = {
+        proxy_id
+        for (proxy_id,) in db.query(Proxy.id).filter(Proxy.id.in_(normalized_ids)).all()
+    }
+    not_found_ids = [proxy_id for proxy_id in normalized_ids if proxy_id not in existing_ids]
+
+    deleted_count = 0
+    if existing_ids:
+        deleted_count = db.query(Proxy).filter(Proxy.id.in_(existing_ids)).delete(synchronize_session=False)
+        db.commit()
+
+    return {
+        "requested_count": len(normalized_ids),
+        "deleted_count": deleted_count,
+        "not_found_ids": not_found_ids,
+    }
+
+def delete_disabled_proxies(db: Session) -> int:
+    """删除所有已禁用代理"""
+    deleted = db.query(Proxy).filter(Proxy.enabled == False).delete(synchronize_session=False)
+    db.commit()
+    return deleted
+
 def update_proxy_last_used(db: Session, proxy_id: int) -> bool:
     """更新代理最后使用时间"""
     db_proxy = get_proxy_by_id(db, proxy_id)
@@ -569,6 +610,16 @@ def set_proxy_default(db: Session, proxy_id: int) -> Optional[Proxy]:
     proxy = db.query(Proxy).filter(Proxy.id == proxy_id).first()
     if proxy:
         proxy.is_default = True
+        db.commit()
+        db.refresh(proxy)
+    return proxy
+
+
+def unset_proxy_default(db: Session, proxy_id: int) -> Optional[Proxy]:
+    """取消指定代理的默认标记"""
+    proxy = db.query(Proxy).filter(Proxy.id == proxy_id).first()
+    if proxy:
+        proxy.is_default = False
         db.commit()
         db.refresh(proxy)
     return proxy
@@ -780,6 +831,63 @@ def delete_tm_service(db: Session, service_id: int) -> bool:
     db.commit()
     return True
 
+
+def create_newapi_service(
+    db: Session,
+    name: str,
+    api_url: str,
+    api_key: str,
+    enabled: bool = True,
+    priority: int = 0,
+    channel_type: int = 57,
+    channel_base_url: str = "",
+    channel_models: str = "gpt-5.4,gpt-5,gpt-5-codex,gpt-5-codex-mini,gpt-5.1,gpt-5.1-codex,gpt-5.1-codex-max,gpt-5.1-codex-mini,gpt-5.2,gpt-5.2-codex,gpt-5.3-codex,gpt-5-openai-compact,gpt-5-codex-openai-compact,gpt-5-codex-mini-openai-compact,gpt-5.1-openai-compact,gpt-5.1-codex-openai-compact,gpt-5.1-codex-max-openai-compact,gpt-5.1-codex-mini-openai-compact,gpt-5.2-openai-compact,gpt-5.2-codex-openai-compact,gpt-5.3-codex-openai-compact",
+) -> NewapiService:
+    svc = NewapiService(
+        name=name,
+        api_url=api_url,
+        api_key=api_key,
+        enabled=enabled,
+        priority=priority,
+        channel_type=channel_type,
+        channel_base_url=channel_base_url,
+        channel_models=channel_models,
+    )
+    db.add(svc)
+    db.commit()
+    db.refresh(svc)
+    return svc
+
+
+def get_newapi_service_by_id(db: Session, service_id: int) -> Optional[NewapiService]:
+    return db.query(NewapiService).filter(NewapiService.id == service_id).first()
+
+
+def get_newapi_services(db: Session, enabled=None):
+    q = db.query(NewapiService)
+    if enabled is not None:
+        q = q.filter(NewapiService.enabled == enabled)
+    return q.order_by(NewapiService.priority.asc(), NewapiService.id.asc()).all()
+
+
+def update_newapi_service(db: Session, service_id: int, **kwargs):
+    svc = get_newapi_service_by_id(db, service_id)
+    if not svc:
+        return None
+    for k, v in kwargs.items():
+        setattr(svc, k, v)
+    db.commit()
+    db.refresh(svc)
+    return svc
+
+
+def delete_newapi_service(db: Session, service_id: int) -> bool:
+    svc = get_newapi_service_by_id(db, service_id)
+    if not svc:
+        return False
+    db.delete(svc)
+    db.commit()
+    return True
 
 def update_outlook_refresh_token(db: Session, service_id: int, email: str, new_refresh_token: str):
     """更新 EmailService.config 中指定邮箱的 refresh_token"""
